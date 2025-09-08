@@ -5,4 +5,8 @@ Project Title: Synthesis of Diffusion-Weighted Magnetic Resonance Images using D
 
 ![Demo](./unet_rotation.gif)
 
+![Demo](./diffusion_rotation.gif)
+
+Inspired by https://github.com/mengweiren/q-space-conditioned-dwi-synthesis 
+
 NOTE: still transferring code to this repository...
