@@ -76,10 +76,8 @@ class FiLM(nn.Module):
 
 class UNet(nn.Module):
 
-    def __init__(self, in_chan=1, out_chan=1, cond_dim=2):
-        # originally conditional dim = 2 for x,y coord of light source, 
-        # then = 1 for scalar angle in radians
-        # now back to dim=2, but for 2d coord on unit circle from cos(theta), sin(theta)
+    def __init__(self, in_chan=1, out_chan=1, cond_dim=1):
+        # cond_dim depends on what we pass to film layer (currently cond_dim = 1 -> timestep value t)
 
         super().__init__()
 
@@ -104,22 +102,22 @@ class UNet(nn.Module):
 
 
     def forward(self, x, angle):
-        # input image x: torch.Size([batch_size, 1, 64, 64])
+        # input image x: torch.Size([batch_size, 1, 96, 96])
         # source: torch.Size([batch_size, cond_dim])
 
-        x1, p1 = self.down1(x)   # [B, 64, 32, 32]
-        x2, p2 = self.down2(p1)  # [B, 128, 16, 16]
-        x3, p3 = self.down3(p2)  # [B, 256, 8, 8]
-        x4, p4 = self.down4(p3)  # [B, 512, 4, 4]
+        x1, p1 = self.down1(x)   # [B, 64, 48, 48]
+        x2, p2 = self.down2(p1)  # [B, 128, 24, 24]
+        x3, p3 = self.down3(p2)  # [B, 256, 12, 12]
+        x4, p4 = self.down4(p3)  # [B, 512, 6, 6]
 
-        b = self.bottleneck(p4)  # [B, 1024, 4, 4]
-        b = self.film(b, angle) # [B, 1024, 4, 4]
+        b = self.bottleneck(p4)  # [B, 1024, 6, 6]
+        b = self.film(b, angle) # [B, 1024, 6, 6]
 
-        u1 = self.up1(x4, b)     # [B, 512, 8, 8]
-        u2 = self.up2(x3, u1)    # [B, 256, 16, 16]
-        u3 = self.up3(x2, u2)    # [B, 128, 32, 32]
-        u4 = self.up4(x1, u3)    # [B, 64, 64, 64]
+        u1 = self.up1(x4, b)     # [B, 512, 12, 12]
+        u2 = self.up2(x3, u1)    # [B, 256, 24, 24]
+        u3 = self.up3(x2, u2)    # [B, 128, 48, 48]
+        u4 = self.up4(x1, u3)    # [B, 64, 96, 96]
 
-        output = self.final_conv(u4) # [B, 1, 64, 64]
+        output = self.final_conv(u4) # [B, 1, 96, 96]
         
         return output

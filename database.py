@@ -1,179 +1,136 @@
 import numpy as np
-import scipy
-from scipy.spatial.distance import cdist
-from scipy.stats.qmc import Sobol
-from skimage import measure
-import random
-from torch.utils.data import Dataset
+import os
+
 import torch
+from torch.utils.data import Dataset
+import torchio as tio
 
 
-class LightSourceDB(Dataset):   # custom dataset
+class MRImagesDB(Dataset):
 
-    def __init__(self, num_samples=10000, method="random", min_angle=None, max_angle=None, fixed_angle=None):
+    def __init__(self, img_dir_path, bvals_path, bvecs_path, volume_dims, num_samples, 
+                 slice_axis=None, subject=None, slice_idx=None, bval=None, bvec=None):
         super().__init__()
+        
+        # store image dir and list of subjects
+        self.img_dir_path = img_dir_path
+        self.subdirs = next(os.walk(img_dir_path))[1]  
+
+        # load bvals and bvecs  (same aquisition protocol across subjects)
+        self.bvals = np.loadtxt(bvals_path)   # shape (n,)
+        self.bvecs = np.loadtxt(bvecs_path)   # shape (3,n)
+
+        # indices where bvals are zero or non zero (diffusion weighted)
+        self.b0_inds = np.where(self.bvals == 0)[0]
+        self.dw_inds = np.where(self.bvals > 0)[0]
+
+        # each volume has size = [1,H,W,D]  (currently 70 horizontal slices [1, 96, 96, 70])
+        self.volume_dims = volume_dims
+
+        # number of samples desired
         self.num_samples = num_samples
-        self.method = method            # select method for position generation
-        self.min_angle = min_angle
-        self.max_angle = max_angle
-        self.fixed_angle = fixed_angle
+
+        # 2d slice axis -> 0 = saggital, 1 = coronal, 2 = horizontal (default)
+        self.slice_axis = slice_axis
+
+        # selected parameters if desired 
+        self.subject = subject
+        self.slice_idx = slice_idx
+        self.bval = bval
+        self.bvec = bvec
 
     def __len__(self):
-        # can set length as long as we want, bc generating on the fly
+        # total num of possible images = subjects x volumes per subject x slices per volume
         return self.num_samples
-    
+
     def __getitem__(self, idx):
-        # typically called at batch level
-        # no index if generating on fly
 
-        imshape = np.array([64] * 2) # image size
-        radius = 31  # fixed radius
+        # random selections
+        subject = np.random.choice(self.subdirs) if self.subject is None else self.subject
+        dw_idx = np.random.choice(self.dw_inds) 
+        b0_idx = np.random.choice(self.b0_inds)
 
-        # create x,y coords of light source position
-        angle = gen_light_pos(self.method, self.min_angle, self.max_angle, self.fixed_angle) 
+        # generate pathnames
+        anat_path = os.path.join(self.img_dir_path, subject, 'anat', subject + '_t1.nii.gz')
+        dw_path = os.path.join(self.img_dir_path, subject, 'dwi', subject + '_dwi_preproc_' + str(dw_idx) + '.nii.gz')
+        b0_path = os.path.join(self.img_dir_path, subject, 'dwi', subject + '_dwi_preproc_' + str(b0_idx) + '.nii.gz')
+
+        # load image volumes with torchio and extract numpy arrays
+        anat_vol = tio.ScalarImage(anat_path).data.numpy()     # [1, H, W, D] = [1, 96, 96, 70]
+        dw_vol = tio.ScalarImage(dw_path).data.numpy()
+        b0_vol = tio.ScalarImage(b0_path).data.numpy()
+
+        # normalize
+        anat_vol_norm = normalize(anat_vol)  # torchio transformation
+        dw_vol_norm = np.clip(dw_vol / (b0_vol + 1e-10), 0, 1)  # normalize by b0 volume
+
+        # create and apply mask
+        mask = anat_vol > 0
+        dw_vol_norm = dw_vol_norm * mask
+
+        # pick random non-empty slice   (if slice_axis is none, keep entire 3d volume)
+        other_axes = tuple(np.delete(range(3), self.slice_axis))
+        mask_slice_axis = np.any(anat_vol[0,:] > 0, axis=other_axes)              # identify slices that are not all 0
+        mask_idxs = np.where(mask_slice_axis)[0]                                  # get indices of non-empty slices with data and take random slice
+        slice_idx = np.random.choice(range(mask_idxs[0], mask_idxs[-1])) if self.slice_idx is None else self.slice_idx       
         
-        # original image and the resulting shadow image and source vector
-        input, target, source = generate_img_pair(imshape, angle, radius)
+        # take slices
+        anat_slice = np.take(anat_vol_norm, slice_idx, axis=self.slice_axis + 1)  # +1 bc shape [1, H, W]
+        dw_slice = np.take(dw_vol_norm, slice_idx, axis=self.slice_axis + 1)
 
-        return (input, target, source)
-    
+        # convert np arrays to tensors
+        anat_slice = torch.from_numpy(anat_slice).float()
+        dw_slice = torch.from_numpy(dw_slice).float()
 
-def generate_img_pair(imshape, angle, radius):
-    # function to generate a random shape and its shadow image
-
-    source_vector = np.array([np.cos(angle), np.sin(angle)])  # 2d coord of angle on unit circle
-    source = radius * source_vector  # scale by radius
-    source = np.round(source + (imshape[0]-1)/2).astype(int) # shift from central coord to pixel coords
-
-    # generate a random shape mask (catches error)
-    while True:
-        try:
-            shape = genSegImg(imshape // 2, 5, sigma=5) > 0
-            if np.any(shape):
-                break
-        except ValueError:
-            # this catches the argmax of empty sequence issue
-            print("error raised in gen seg!!")
-            continue
-
-    # create original image using shape
-    input = np.ones(imshape)
-    input[imshape[0]//4-1:3*imshape[0]//4-1, imshape[1]//4-1:3*imshape[1]//4-1] = ~shape
-
-    # shadow computation
-    target = visibility(source, input.copy())
-
-    # convert from float64 to float32 and make 3D to account for channel (1x64x64)
-    input = input[np.newaxis, :].astype(np.float32)
-    target = target[np.newaxis, :].astype(np.float32)
-    source_vector = source_vector.astype(np.float32)
-
-    # invert images (so background is 0 instead of 1 to account for zero padding)
-    input, target = 1 - input, 1 - target
-
-    # scale to [-1, 1]
-    input = 2 * input - 1
-    target = 2 * target - 1
-
-    # return the original image, the resulting shadow image, and the angle coords
-    return (input, target, source_vector)
-
-
-def gen_light_pos(method, min_angle, max_angle, fixed_angle):
-
-    if method=="fixed":
-        angle = fixed_angle
-
-    elif method=="corners":  # pos is one of 4 corners
-        corner_angles = [0, np.pi / 2, np.pi, -np.pi / 2]   # in radians
-        rand_angle = random.choice([0, 1, 2, 3])
-        angle = corner_angles[rand_angle]
-
-    elif method=="random":
-        angle = np.pi * (2 * np.random.rand() - 1) # radians between -pi and pi
-
-    elif method=="constrained":  # constrains pos between min and max angle (radians from -pi to pi)
-        angle = min_angle + (max_angle - min_angle) * np.random.rand()
-
-    return angle
-
-
-# ------------------------------------------------------------------------------------------------------------------------------
-
-# Antoine's code to generate shadow images
-
-def visibility_from_corner(grid):
-    
-    for x in range(grid.shape[0]):
-        for y in range(int(x==0), grid.shape[1]):
-            grid[x,y] *= (x*grid[x-1,y] + y*grid[x,y-1]) / (x + y)
-            
-    return
-
-def visibility(source, grid):
-
-    #grid = grid1.copy() # copy so doesn't affect original
-
-    visibility_from_corner(grid[source[0]:,source[1]:])
-    visibility_from_corner(grid[source[0]::-1,source[1]:])
-    visibility_from_corner(grid[source[0]::-1,source[1]::-1])
-    visibility_from_corner(grid[source[0]:,source[1]::-1])
-    
-    return grid
-
-
-def genSegImg(volshape, nlabs, npts=128, sigma=25, scal=0.8, seed=None, 
-              single_cc=True, rm_border=True):
-    
-    volshape = np.array(volshape)
-    ndims = len(volshape)
-    grid = np.indices(volshape).reshape(ndims, -1).T
-    
-    seg = np.zeros((grid.shape[0], nlabs+1))
-    sobol = Sobol(ndims, seed=seed)
-    for j in range(nlabs+1):
-        pts = (scal*(sobol.random(npts)-0.5) + 0.5)*(volshape-1)
+        # if slice is not horizontal, pad volume to square
+        if self.slice_axis == 0 or self.slice_axis == 1:
+            # make copy and convert to float32 tensor
+            anat_slice = anat_slice.clone().detach().float() # shape [1, H, W]
+            dw_slice = dw_slice.clone().detach().float()
+            # pad to square
+            anat_slice = pad_to_square(anat_slice)
+            dw_slice = pad_to_square(dw_slice)
         
-        sqdist = cdist(grid, pts, 'sqeuclidean')
-        wmap = np.exp(-sqdist / sigma**2)
-        seg[:,j] = np.sum(wmap, axis=1)
-             
-    seg = np.argmax(seg, axis=-1).reshape(volshape)
-  
-    if rm_border:
+        # normalize bval between 0-1 by dividing by largest bval most scanners can do
+        bval = self.bvals[dw_idx] / 5000  if self.bval is None else self.bval / 5000
+        
+        # transform bvec to preserve symmetry: x,y,z -> x2,y2,z2,xy,xz,yz
+        bvec = self.bvecs[:, dw_idx]
+        bvec_trans = transform_bvec(self.bvec if self.bvec is not None else bvec) 
 
-        # relabel
-        seg2 = np.zeros_like(seg)
-        currlab = 0
-        for lab in np.unique(seg):
-            if lab == 0:  
-                continue
-            
-            mask = (seg == lab)
-            labreg, nbits = scipy.ndimage.label(mask)
-            labreg[labreg > 0] += currlab
-            seg2 += labreg
+        # combine acquisition param into single conditioning vector
+        acq_param = torch.tensor([bval, *bvec_trans], dtype=torch.float32)      # size [1,7]
+        
+        return anat_slice, dw_slice, acq_param
 
-            currlab += nbits
 
-        # remove border regions
-        if ndims == 2:
-            edges = np.concatenate([seg2[0, :], seg2[-1, :], 
-                                    seg2[:, 0], seg2[:, -1]])
-        elif ndims == 3:
-            edges = np.concatenate([seg2[0, :, :].ravel(),seg2[-1, :, :].ravel(), 
-                                    seg2[:, 0, :].ravel(),seg2[:, -1, :].ravel(),
-                                    seg2[:, :, 0].ravel(),seg2[:, :, -1].ravel()])
-        edge_labels = np.unique(edges)
-        mask = np.isin(seg2, edge_labels)
-        seg2[mask] = 0
-        seg = np.where(seg2 > 0, seg, 0)
+# transform bvec from xyz to preserve symmetry
+def transform_bvec(bvec):
+    bvec = torch.from_numpy(bvec).float()
+    x, y, z = bvec
+    bvec_trans = torch.stack([x**2, y**2, z**2, x*y, x*z, y*z])
+    return bvec_trans
+
+
+# transformation to normalize an image volume
+normalize = tio.Compose([
+    tio.Clamp(out_min=0),  # zero out negative values (like relu) even though all values should be >= 0
+    tio.RescaleIntensity(out_min_max=(0, 1), percentiles=(0, 99))  # rescale output between 0-1 and avoid outliers
+])
+
+
+# pads 2d slice with zeros to make it square if rectangular depending on slice dir (ex: [96,70] to [96,96])
+def pad_to_square(slice_tensor, pad_value=0.0):
+    C, H, W = slice_tensor.shape
+    size = max(H, W)
     
-    if single_cc:
-        # only keep the biggest connected component
-        seg0 = (seg > 0).astype(np.int16)
-        chunks = measure.label(seg0)
-        chunk_sizes = np.bincount(chunks.ravel())[1:]
-        seg = seg * (chunks == np.argmax(chunk_sizes)+1)
+    pad_h = (size - H) // 2
+    pad_w = (size - W) // 2
+    
+    pad_top, pad_bottom = pad_h, size - H - pad_h
+    pad_left, pad_right = pad_w, size - W - pad_w
+    
+    # F.pad expects padding in (left, right, top, bottom) order for 2D tensors      3D: [C,H,W] -> pad last two dims
+    padded = torch.nn.functional.pad(slice_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=pad_value)
 
-    return seg
+    return padded
