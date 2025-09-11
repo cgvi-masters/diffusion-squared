@@ -1,0 +1,15 @@
+name: diffusion_env
+channels:
+  - defaults
+dependencies:
+  - matplotlib
+  - numpy<2
+  - scikit-image
+  - python==3.12
+  - pandas
+  - scipy
+  - jupyter
+  - pytorch
+  - torchvision
+  - tqdm
+  - onnx
