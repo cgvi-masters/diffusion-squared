@@ -5,16 +5,15 @@ from torch.utils.data import DataLoader
 
 from .architecture import UNet
 from src.database import LightSourceDB
-from .training import get_noise_scheduler
 
 
-def load_model(model_path, device, cond_dim, in_chan):
+def load_unet(model_path, device, in_chan, out_chan, cond_dim):
 
     # load saved model weights (only saved model weights)
     model_dict = torch.load(model_path, map_location=device)
 
     # create model and set to eval mode
-    loaded_model = UNet(cond_dim=cond_dim, in_chan=in_chan)
+    loaded_model = UNet(in_chan=in_chan, out_chan=out_chan, cond_dim=cond_dim)
     loaded_model.load_state_dict(model_dict['model_state_dict'])
     loaded_model.to(device)
     loaded_model.eval()
@@ -45,21 +44,28 @@ def denoise_data(samples, i, pred, z, betas, alphas, alphas_bar):
     return mean + noise
 
 
-def sample(loaded_model, data_loader, n_samples, timesteps, beta_start, beta_end, img_shape, device,
-           sampler='ddpm', ddim_steps=None, ddim_eta=0.0):
+from src_diffusion.training import get_noise_scheduler
 
-    # get noise schedule
-    sched_type = 'linear'
-    betas, alphas, alphas_bar = get_noise_scheduler(sched_type, timesteps, beta_start, beta_end, device)
+def sample_latent(loaded_model, data_loader, n_samples, timesteps, beta_start, beta_end, device,
+           sampler, encoder_blob, decoder_shadow, ddim_steps=None, ddim_eta=0.0):
 
-    # generate noise samples
-    samples = torch.randn(n_samples, 1, img_shape[1], img_shape[2]).to(device)
+    # generate noise schedule
+    betas, alphas, alphas_bar = get_noise_scheduler('linear', timesteps, beta_start, beta_end, device)
 
     # generate samples from dataset for conditioning
     batch = next(iter(data_loader))
     blobs = batch[0].to(device)             # extract the blob images
     gt_shadows = batch[1].to(device)        # extract the ground truth shadows
     acq_param = batch[2].to(device)         # extract the acq params
+
+    # NEWWWWWWW
+    # embed blob images with encoder
+    latent_blobs = encoder_blob(blobs)
+
+    # generate noise samples    (must match shape of latent space)
+    latent_dims = [8, 24, 24]       # HARDCODED  [8, 16, 16]
+    samples = torch.randn(n_samples, latent_dims[0], latent_dims[1], latent_dims[2]).to(device)
+    #samples = torch.randn(n_samples, 1, img_shape[1], img_shape[2]).to(device)
     
     # save snapshots during generation
     snapshots = []
@@ -82,7 +88,7 @@ def sample(loaded_model, data_loader, n_samples, timesteps, beta_start, beta_end
                 t = torch.full((n_samples, 1), i / timesteps, device=device)  # reshape timestep tensor and rescale
                 cond_vec = torch.cat([t, acq_param], dim=1)  # concat t and acq_param
                 z = torch.randn_like(samples) if i > 0 else torch.zeros_like(samples)    # sample random noise to add back in
-                combo_signal = torch.cat([samples, blobs], dim=1)  # concatenate noisy shadow image with blob image
+                combo_signal = torch.cat([samples, latent_blobs], dim=1)  # concatenate noisy shadow image with blob image
 
                 # forward pass through model to predict noise
                 pred = loaded_model(combo_signal, cond_vec)         
@@ -91,7 +97,11 @@ def sample(loaded_model, data_loader, n_samples, timesteps, beta_start, beta_end
                 samples = denoise_data(samples, i, pred, z, betas, alphas, alphas_bar)
 
                 if i % save_interval == 0:
-                    snap = samples.detach().squeeze(dim=1).cpu().numpy()
+
+                    # NEWWWWW
+                    # decode the predictions using the shadow decoder
+                    decoded_samples = decoder_shadow(samples)
+                    snap = decoded_samples.detach().squeeze(dim=1).cpu().numpy()
                     snapshots.append(snap)
 
         elif sampler == 'ddim':
@@ -99,7 +109,7 @@ def sample(loaded_model, data_loader, n_samples, timesteps, beta_start, beta_end
                 i = ddim_timesteps[idx]
                 t = torch.full((n_samples, 1), i / timesteps, device=device)
                 cond_vec = torch.cat([t, acq_param], dim=1)  # concat t and acq_param
-                combo_signal = torch.cat([samples, blobs], dim=1)  # concatenate noisy shadow image with blob image
+                combo_signal = torch.cat([samples, latent_blobs], dim=1)  # concatenate noisy shadow image with blob image
 
                 pred_noise = loaded_model(combo_signal, cond_vec)
 
@@ -122,8 +132,8 @@ def sample(loaded_model, data_loader, n_samples, timesteps, beta_start, beta_end
                     snap = samples.detach().squeeze(dim=1).cpu().numpy()
                     snapshots.append(snap)
 
-        
-    '''
+
+    
     # Plot: each row = sample, each col = timestep snapshot
     num_cols = len(snapshots) + 2
     fig, axs = plt.subplots(n_samples, num_cols, figsize=(3 * num_cols, 3 * n_samples))
@@ -161,9 +171,8 @@ def sample(loaded_model, data_loader, n_samples, timesteps, beta_start, beta_end
 
     plt.tight_layout()
     plt.show()
-    '''
-    
-    
     
 
-    return samples, gt_shadows, blobs
+
+    # return the decoded samples and the ground truth dmri images
+    return decoded_samples, gt_shadows, blobs

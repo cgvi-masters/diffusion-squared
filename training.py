@@ -4,23 +4,25 @@ from tqdm import tqdm   # prints progress of training
 import numpy as np
 import pandas as pd
 import os
+from .testing import sample_latent
+
 
 def sample_batch(data_loader):
+
     # list of len=num outputs of getitem (so 2 here)
     # one list has all the anatomical images, one has the diffusion images
     batch = next(iter(data_loader)) 
     
     # get bval and bvec
-    bval = batch[2][0][0] * 5000    # un-normalize for display
-    bvec = batch[2][0][1:4].sqrt()  # undo transformation
-
-    # requires formatting otherwise it prints the full precision of the 32bit float
-    print("bval: {:.4f}".format(bval.item()))  
-    print("bvec:", [round(x, 4) for x in bvec.tolist()])
+    bval, bvec = batch[2][0][0], batch[2][0][1:]
 
     # get first anatomical img and corresponding diffusion image
     anat = batch[0][0,0,:]
     dw = batch[1][0,0,:]
+
+    # requires formatting otherwise it prints the full precision of the 32bit float
+    print("bval: {:.4f}".format(bval.item()))  
+    print("bvec:", [round(x, 4) for x in bvec.tolist()])
 
     fig, axs = plt.subplots(1, 2, figsize=(5, 10))
     axs[0].imshow(anat, cmap='grey')
@@ -31,11 +33,8 @@ def sample_batch(data_loader):
     plt.show()
 
 
-def train_diffusion_model(model, device, train_set, train_loader, loss_fn, optimizer,
-                epochs, batch_size, learning_rate, timesteps, beta_start, beta_end):
-    
-    # save img data dimensions
-    img_shape = next(iter(train_loader))[0][0].shape
+def train_model(model, device, train_set, train_loader, loss_fn, optimizer,
+                epochs, batch_size, learning_rate, timesteps, beta_start, beta_end, data_type, encoder_shadow, encoder_blob):
 
     # create linear noise scheduler based on DDPM
     betas, alphas, alphas_bar = get_noise_scheduler('linear', timesteps, beta_start, beta_end, device)
@@ -56,7 +55,8 @@ def train_diffusion_model(model, device, train_set, train_loader, loss_fn, optim
     # iteratively train and test
     for epoch in tqdm(range(epochs)):
 
-        train_loss = training_loop(model, train_loader, loss_fn, optimizer, device, timesteps, alphas_bar)
+        train_loss = training_loop(model, train_loader, loss_fn, optimizer, device, timesteps, alphas_bar, data_type, 
+                                   encoder_shadow, encoder_blob)
 
         # add losses to log
         loss_df.loc[epoch] = [epoch + 1, train_loss]
@@ -73,13 +73,6 @@ def train_diffusion_model(model, device, train_set, train_loader, loss_fn, optim
         
         if epoch % 50 == 0:
             print(f"  Epoch [{epoch+1}/{epochs}] Train loss: {train_loss:.5f}")
-
-        # visualize evolution of denoising
-        #if epoch % 50 == 0:
-        #    model.eval()
-        #    with torch.no_grad():
-        #        sample(model, 1, timesteps, betas, alphas, alphas_bar, img_shape, device)
-        #    model.train()
             
     # display loss curve
     plot_loss_curve(loss_df)
@@ -99,7 +92,8 @@ def get_noise_scheduler(sched_type, timesteps, beta_start, beta_end, device):
     return betas, alphas, alphas_bar
 
 
-def training_loop(model, dataloader, loss_fn, optimizer, device, timesteps, alphas_bar):
+def training_loop(model, dataloader, loss_fn, optimizer, device, timesteps, alphas_bar, data_type, 
+                  encoder_shadow, encoder_blob):
 
     model.train()
     train_loss = 0
@@ -111,23 +105,26 @@ def training_loop(model, dataloader, loss_fn, optimizer, device, timesteps, alph
         input, target, acq_param = input.to(device), target.to(device), acq_param.to(device)
 
         # decide if training on blobs or shadows
-        #if signal_type == 'blobs': signal = input 
-        #elif signal_type == 'shadows': signal = target
-        signal = target
+        #signal = target.to(device)
+
+        ### NEWWWWWW
+        # embed the signal using encoder - make sure to adjust dimensions
+        latent_signal = encoder_shadow(target)
+        latent_input = encoder_blob(input)
 
         # sample timesteps for each image in batch
-        t = torch.randint(0, timesteps, (signal.shape[0],)).to(device)
+        t = torch.randint(0, timesteps, (latent_signal.shape[0],)).to(device)
 
         # noise the data
-        noise = torch.randn_like(signal)      # generate gaussian noise: each pixel sampled from N(0,1), values mostly between -3 and 3
-        noisy_signal = noise_data(signal, t, noise, alphas_bar)
+        noise = torch.randn_like(latent_signal)      # generate gaussian noise: each pixel sampled from N(0,1), values mostly between -3 and 3
+        noisy_signal = noise_data(latent_signal, t, noise, alphas_bar)
 
         # create conditioning vector by concatenating timestep and acquisition parameters ([B, 2])
         t_scaled = t.unsqueeze(1) / timesteps   # rescale and reshape to [B, 1]
         cond_vec = torch.cat([t_scaled, acq_param], dim=1)  # new shape [B, 3]
 
         # condition on blob shape image too (by concatenating to noisy image)
-        combo_signal = torch.cat([noisy_signal, input], dim=1)
+        combo_signal = torch.cat([noisy_signal, latent_input], dim=1)
 
         # forward pass to recover noise
         pred = model(combo_signal, cond_vec)
@@ -168,3 +165,14 @@ def plot_loss_curve(loss_df):
     plt.grid(False)
     plt.tight_layout()
     plt.show()
+
+
+# dynamically set number of workers to optimize use of cores
+def get_num_workers():
+    try:
+        num_cpus = os.cpu_count()
+        # heuristic: leave 1–2 cores free
+        workers = max(1, num_cpus - 2)
+        return workers
+    except:
+        return 1  # fallback default
