@@ -8,8 +8,7 @@ import torchio as tio
 
 class MRImagesDB(Dataset):
 
-    def __init__(self, img_dir_path, bvals_path, bvecs_path, volume_dims, num_samples, 
-                 slice_axis=None, subject=None, slice_idx=None, bval=None, bvec=None):
+    def __init__(self, img_dir_path, bvals_path, bvecs_path, volume_dims, num_samples, slice_axis=None):
         super().__init__()
         
         # store image dir and list of subjects
@@ -27,26 +26,20 @@ class MRImagesDB(Dataset):
         # each volume has size = [1,H,W,D]  (currently 70 horizontal slices [1, 96, 96, 70])
         self.volume_dims = volume_dims
 
-        # number of samples desired
+        # number of samples desired (total num of images = subjects x volumes per subject x slices per volume)
         self.num_samples = num_samples
 
-        # 2d slice axis -> 0 = saggital, 1 = coronal, 2 = horizontal (default)
+        # 2d slice axis -> default 0 = horizontal, 1 = , 2 = 
         self.slice_axis = slice_axis
 
-        # selected parameters if desired 
-        self.subject = subject
-        self.slice_idx = slice_idx
-        self.bval = bval
-        self.bvec = bvec
-
     def __len__(self):
-        # total num of possible images = subjects x volumes per subject x slices per volume
+        # lets just do a subset for now (not every possible image)
+        # return len(self.subdirs) * len(self.bvals) * self.volume_dims[3]
         return self.num_samples
 
     def __getitem__(self, idx):
-
         # random selections
-        subject = np.random.choice(self.subdirs) if self.subject is None else self.subject
+        subject = np.random.choice(self.subdirs)  # for now only 1 subject in mini_dataset
         dw_idx = np.random.choice(self.dw_inds) 
         b0_idx = np.random.choice(self.b0_inds)
 
@@ -67,70 +60,48 @@ class MRImagesDB(Dataset):
         # create and apply mask
         mask = anat_vol > 0
         dw_vol_norm = dw_vol_norm * mask
-
+        
         # pick random non-empty slice   (if slice_axis is none, keep entire 3d volume)
         other_axes = tuple(np.delete(range(3), self.slice_axis))
-        mask_slice_axis = np.any(anat_vol[0,:] > 0, axis=other_axes)              # identify slices that are not all 0
-        mask_idxs = np.where(mask_slice_axis)[0]                                  # get indices of non-empty slices with data and take random slice
-        slice_idx = np.random.choice(range(mask_idxs[0], mask_idxs[-1])) if self.slice_idx is None else self.slice_idx       
+        mask_slice_axis = np.any(anat_vol[0,:] > 0, axis=other_axes)                   # identify slices that are not all 0
+        mask_idxs = np.where(mask_slice_axis)[0]                                  # get indices of those slices with some data
+        slice_idx =  np.random.choice(range(mask_idxs[0], mask_idxs[-1]))         # random slice within non-empty range
         
         # take slices
         anat_slice = np.take(anat_vol_norm, slice_idx, axis=self.slice_axis + 1)  # +1 bc shape [1, H, W]
         dw_slice = np.take(dw_vol_norm, slice_idx, axis=self.slice_axis + 1)
-
-        # convert np arrays to tensors
-        anat_slice = torch.from_numpy(anat_slice).float()
-        dw_slice = torch.from_numpy(dw_slice).float()
-
-        # if slice is not horizontal, pad volume to square
-        if self.slice_axis == 0 or self.slice_axis == 1:
-            # make copy and convert to float32 tensor
-            anat_slice = anat_slice.clone().detach().float() # shape [1, H, W]
-            dw_slice = dw_slice.clone().detach().float()
-            # pad to square
-            anat_slice = pad_to_square(anat_slice)
-            dw_slice = pad_to_square(dw_slice)
         
-        # normalize bval between 0-1 by dividing by largest bval most scanners can do
-        bval = self.bvals[dw_idx] / 5000  if self.bval is None else self.bval / 5000
-        
-        # transform bvec to preserve symmetry: x,y,z -> x2,y2,z2,xy,xz,yz
+        # get bval / bvector and combine acquisition param into single conditioning vector
+        bval = self.bvals[dw_idx] / 5000  # normalize between 0-1 by dividing by largest bval most scanners can do
         bvec = self.bvecs[:, dw_idx]
-        bvec_trans = transform_bvec(self.bvec if self.bvec is not None else bvec) 
+        acq_param = torch.tensor([bval, *bvec], dtype=torch.float32)
 
-        # combine acquisition param into single conditioning vector
-        acq_param = torch.tensor([bval, *bvec_trans], dtype=torch.float32)      # size [1,7]
+        # convert to float32 tensors
+        anat_slice = torch.tensor(anat_slice, dtype=torch.float32)  # shape [1, H, W]
+        dw_slice = torch.tensor(dw_slice, dtype=torch.float32)
+        #anat_slice = anat_slice[np.newaxis, :].astype(np.float32)
+        #dw_slice = dw_slice[np.newaxis, :].astype(np.float32)
         
         return anat_slice, dw_slice, acq_param
 
 
-# transform bvec from xyz to preserve symmetry
-def transform_bvec(bvec):
-    bvec = torch.from_numpy(bvec).float()
-    x, y, z = bvec
-    bvec_trans = torch.stack([x**2, y**2, z**2, x*y, x*z, y*z])
-    return bvec_trans
-
-
-# transformation to normalize an image volume
 normalize = tio.Compose([
-    tio.Clamp(out_min=0),  # zero out negative values (like relu) even though all values should be >= 0
-    tio.RescaleIntensity(out_min_max=(0, 1), percentiles=(0, 99))  # rescale output between 0-1 and avoid outliers
+    # transformation to normalize an image volume
+    tio.Clamp(out_min=0),  # zero out negative values (like relu)
+    tio.RescaleIntensity(out_min_max=(0, 1), percentiles=(0.5, 99.5))  # rescale output between 0-1 and avoid outliers
 ])
 
 
-# pads 2d slice with zeros to make it square if rectangular depending on slice dir (ex: [96,70] to [96,96])
-def pad_to_square(slice_tensor, pad_value=0.0):
-    C, H, W = slice_tensor.shape
-    size = max(H, W)
-    
-    pad_h = (size - H) // 2
-    pad_w = (size - W) // 2
-    
-    pad_top, pad_bottom = pad_h, size - H - pad_h
-    pad_left, pad_right = pad_w, size - W - pad_w
-    
-    # F.pad expects padding in (left, right, top, bottom) order for 2D tensors      3D: [C,H,W] -> pad last two dims
-    padded = torch.nn.functional.pad(slice_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=pad_value)
+# function to add symmetric padding so each dimension is divisible by 2**k
+def pad(volume, k):
 
-    return padded
+    input_shape = np.array(volume.shape)
+    target_shape = np.ceil(input_shape / 2**k) * 2**k
+
+    pad_before = np.round((target_shape - input_shape) / 2).astype(int) # convert float to int
+    pad_after = (target_shape - input_shape - pad_before).astype(int)
+
+    padding = np.stack((pad_before, pad_after), axis=1)
+    padded_vol = np.pad(volume, padding)
+    
+    return padded_vol

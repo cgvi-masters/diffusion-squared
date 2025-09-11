@@ -76,8 +76,8 @@ class FiLM(nn.Module):
 
 class UNet(nn.Module):
 
-    def __init__(self, in_chan=1, out_chan=1, cond_dim=1):
-        # cond_dim depends on what we pass to film layer (currently cond_dim = 1 -> timestep value t)
+    def __init__(self, in_chan=1, out_chan=1, cond_dim=4):
+        # cond_dim depends on what we pass to film layer (currently cond_dim = 4 -> 3d bvec and scalar bval)
 
         super().__init__()
 

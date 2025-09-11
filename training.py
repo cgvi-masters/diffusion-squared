@@ -4,133 +4,23 @@ from tqdm import tqdm   # prints progress of training
 import numpy as np
 import pandas as pd
 import os
-from .testing import sample_latent
 
-
-def sample_batch(data_loader):
-
-    # list of len=num outputs of getitem (so 2 here)
-    # one list has all the anatomical images, one has the diffusion images
-    batch = next(iter(data_loader)) 
-    
-    # get bval and bvec
-    bval, bvec = batch[2][0][0], batch[2][0][1:]
-
-    # get first anatomical img and corresponding diffusion image
-    anat = batch[0][0,0,:]
-    dw = batch[1][0,0,:]
-
-    # requires formatting otherwise it prints the full precision of the 32bit float
-    print("bval: {:.4f}".format(bval.item()))  
-    print("bvec:", [round(x, 4) for x in bvec.tolist()])
-
-    fig, axs = plt.subplots(1, 2, figsize=(5, 10))
-    axs[0].imshow(anat, cmap='grey')
-    axs[0].set_title("Anatomical Image")
-    axs[1].imshow(dw, cmap='grey')
-    axs[1].set_title("Diffusion Image")
-    plt.tight_layout()
-    plt.show()
-
-
-def train_model(model, device, train_set, train_loader, loss_fn, optimizer,
-                epochs, batch_size, learning_rate, timesteps, beta_start, beta_end, data_type, encoder_shadow, encoder_blob):
-
-    # create linear noise scheduler based on DDPM
-    betas, alphas, alphas_bar = get_noise_scheduler('linear', timesteps, beta_start, beta_end, device)
-
-    # ensure dir exists to save model
-    os.makedirs('models_diffusion', exist_ok=True)
-
-    # cur model numnber
-    model_num = len([f for f in os.listdir('models_diffusion')]) + 1
-    model_path = f"models_diffusion/model{model_num}.pth"
-
-    # pandas df to store train/test loss for plotting
-    loss_df = pd.DataFrame(columns=['epoch', 'train_loss'])
-
-    # best loss initialized at inf
-    best_loss = np.inf
-
-    # iteratively train and test
-    for epoch in tqdm(range(epochs)):
-
-        train_loss = training_loop(model, train_loader, loss_fn, optimizer, device, timesteps, alphas_bar, data_type, 
-                                   encoder_shadow, encoder_blob)
-
-        # add losses to log
-        loss_df.loc[epoch] = [epoch + 1, train_loss]
-
-        # save model with lowest test loss (also store meta data)
-        if train_loss < best_loss:
-            torch.save({
-                'epoch': epoch + 1,
-                'batch_size': batch_size,
-                'num_samples': len(train_set),
-                'learning_rate': learning_rate,
-                'model_state_dict': model.state_dict(),
-                }, model_path)
-        
-        if epoch % 50 == 0:
-            print(f"  Epoch [{epoch+1}/{epochs}] Train loss: {train_loss:.5f}")
-            
-    # display loss curve
-    plot_loss_curve(loss_df)
-
-
-# creates the noise scheduler (can chooose type: linear, cosine, etc.)
-def get_noise_scheduler(sched_type, timesteps, beta_start, beta_end, device):
-    if sched_type == 'linear':
-        betas = torch.linspace(beta_start, beta_end, timesteps, device=device)      # noise added relative to previous timestep
-    elif sched_type == 'cosine':
-        pass
-
-    # closed form solution for how much noise is added at each step given t and x0
-    alphas = 1. - betas                                # how much of the signal remains after timestep t
-    alphas_bar = torch.cumprod(alphas, dim=0)          # how data is corrupted overtime
-
-    return betas, alphas, alphas_bar
-
-
-def training_loop(model, dataloader, loss_fn, optimizer, device, timesteps, alphas_bar, data_type, 
-                  encoder_shadow, encoder_blob):
+def training_loop(model, dataloader, loss_fn, optimizer, device):
 
     model.train()
     train_loss = 0
 
-    # iterate through dataloader by batch. # anat_img_slice, dw_img_slice, (bval, bvec)
+    # iterate through dataloader by batch. # anat_img_slice, dw_img_slice, bval, bvec
     for input, target, acq_param in dataloader:
 
         # send data to device
         input, target, acq_param = input.to(device), target.to(device), acq_param.to(device)
 
-        # decide if training on blobs or shadows
-        #signal = target.to(device)
+        # forward pass
+        pred = model(input, acq_param)
 
-        ### NEWWWWWW
-        # embed the signal using encoder - make sure to adjust dimensions
-        latent_signal = encoder_shadow(target)
-        latent_input = encoder_blob(input)
-
-        # sample timesteps for each image in batch
-        t = torch.randint(0, timesteps, (latent_signal.shape[0],)).to(device)
-
-        # noise the data
-        noise = torch.randn_like(latent_signal)      # generate gaussian noise: each pixel sampled from N(0,1), values mostly between -3 and 3
-        noisy_signal = noise_data(latent_signal, t, noise, alphas_bar)
-
-        # create conditioning vector by concatenating timestep and acquisition parameters ([B, 2])
-        t_scaled = t.unsqueeze(1) / timesteps   # rescale and reshape to [B, 1]
-        cond_vec = torch.cat([t_scaled, acq_param], dim=1)  # new shape [B, 3]
-
-        # condition on blob shape image too (by concatenating to noisy image)
-        combo_signal = torch.cat([noisy_signal, latent_input], dim=1)
-
-        # forward pass to recover noise
-        pred = model(combo_signal, cond_vec)
-
-        # calculate loss between predicted and true noise
-        loss = loss_fn(pred, noise)
+        # calculate loss
+        loss = loss_fn(pred, target)
         train_loss += loss.item()
 
         # backward pass and optimization
@@ -141,14 +31,45 @@ def training_loop(model, dataloader, loss_fn, optimizer, device, timesteps, alph
     return train_loss / len(dataloader)  # average loss per batch
 
 
-# noise image to specified noise level
-def noise_data(x, t, noise, alphas_bar):
-    # add extra dims for broadcasting
-    alphas_bar_t = alphas_bar[t][..., None, None, None]
+def testing_loop(model, dataloader, loss_fn, device):
 
-    # scale img and noise accordingly
-    noisy_img = alphas_bar_t.sqrt() * x + (1. - alphas_bar_t).sqrt() * noise
-    return noisy_img
+    model.eval()
+    test_loss = 0
+
+    with torch.no_grad():
+        for input, target, acq_param in dataloader:
+
+            # send data to device
+            input, target, acq_param = input.to(device), target.to(device), acq_param.to(device)
+
+            # forward pass
+            pred = model(input, acq_param)
+
+            # calculate loss
+            loss = loss_fn(pred, target)
+            test_loss += loss.item()
+
+    return test_loss / len(dataloader)  # average loss per batch
+
+
+def sample_batch(data_loader):
+
+    # list of len=num outputs of getitem (so 2 here)
+    # one list has all the anatomical images, one has the diffusion images
+    batch = next(iter(data_loader)) 
+    
+    # print bval and bvec   (requires formatting otherwise it prints the full precision of the 32bit float)
+    bval, bvec = batch[2][0][0], batch[2][0][1:]
+    print("bval: {:.4f}".format(bval.item()))
+    print("bvec:", [round(x, 4) for x in bvec.tolist()])
+
+    fig, axs = plt.subplots(1, 2, figsize=(5, 10))
+    axs[0].imshow(batch[0][0,0,:], cmap='grey')     # print first anatomic img slice
+    axs[0].set_title("Anatomical Image")
+    axs[1].imshow(batch[1][0,0,:], cmap='grey')     # and corresponding diffusion img
+    axs[1].set_title("Diffusion Image")
+    plt.tight_layout()
+    plt.show()
 
 
 def plot_loss_curve(loss_df):
@@ -156,10 +77,11 @@ def plot_loss_curve(loss_df):
     plt.figure(figsize=(8, 5))
 
     plt.plot(loss_df['epoch'], loss_df['train_loss'], label='Train Loss')
+    plt.plot(loss_df['epoch'], loss_df['test_loss'], label='Test Loss')
 
     plt.xlabel('Epoch')
     plt.ylabel('Loss (Log)')
-    plt.title('Training Loss per Epoch')
+    plt.title('Training and Testing Loss per Epoch')
     plt.yscale('log')  # plotted on log scale to enhance small diff
     plt.legend()
     plt.grid(False)
@@ -167,12 +89,51 @@ def plot_loss_curve(loss_df):
     plt.show()
 
 
-# dynamically set number of workers to optimize use of cores
-def get_num_workers():
-    try:
-        num_cpus = os.cpu_count()
-        # heuristic: leave 1–2 cores free
-        workers = max(1, num_cpus - 2)
-        return workers
-    except:
-        return 1  # fallback default
+def train_model(model, device, train_loader, val_loader, loss_fn, optimizer, 
+                epochs, batch_size, learning_rate, train_set):
+
+    # cur model numnber
+    model_num = len([f for f in os.listdir('models')]) + 1
+    model_path = f"models/model_diffusion{model_num}.pth"
+
+    # pandas df to store train/test loss for plotting
+    loss_df = pd.DataFrame(columns=['epoch', 'train_loss', 'test_loss'])
+
+    # best loss initialized at inf
+    best_loss = np.inf
+
+    # iteratively train and test
+    for epoch in tqdm(range(epochs)):
+
+        train_loss = training_loop(model, train_loader, loss_fn, optimizer, device)
+        test_loss = testing_loop(model, val_loader, loss_fn, device)
+
+        # add losses to log
+        loss_df.loc[epoch] = [epoch + 1, train_loss, test_loss]
+
+        # save model with lowest test loss (also store meta data)
+        if test_loss < best_loss:
+            best_loss = test_loss
+            torch.save({
+                'epoch': epoch + 1,
+                'batch_size': batch_size,
+                'num_samples': len(train_set),
+                'learning_rate': learning_rate,
+                'model_state_dict': model.state_dict(),
+                }, model_path)
+        
+        print(f"  Epoch [{epoch+1}/{epochs}] Train loss: {train_loss:.4f} - Test loss: {test_loss:.4f}")
+
+    # display loss curve
+    plot_loss_curve(loss_df)
+
+
+# perturb image to specified noise level
+def perturb_image(x, t, noise, ab_t):
+    # take square root and add extra dims
+    sqrt_ab = ab_t[t].sqrt()[..., None, None, None]
+    sqrt_1minus_ab = (1 - ab_t[t]).sqrt()[..., None, None, None]
+
+    # scale img and noise accordingly
+    noisy_img = sqrt_ab * x + sqrt_1minus_ab * noise
+    return noisy_img
